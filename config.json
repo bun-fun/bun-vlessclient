@@ -1,0 +1,20 @@
+{
+    "log_level": "debug",
+    "local_port": 1080,
+    "remote": {
+        "host": "example.com",
+        "port": 443,
+        "uuid": "00000000-0000-4000-8000-000000000000",
+        "packet_encoding": "xudp"
+    },
+    "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "insecure": false
+    },
+    "transport": {
+        "type": "ws",
+        "path": "/your-websocket-path",
+        "host": "example.com"
+    }
+}

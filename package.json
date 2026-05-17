@@ -1,0 +1,27 @@
+{
+  "name": "bun-vlessclient",
+  "version": "1.0.0",
+  "description": "Bun-native VLESS client with local SOCKS5 proxy",
+  "type": "module",
+  "main": "dist/bun-vlessclient.js",
+  "module": "dist/bun-vlessclient.js",
+  "bin": {
+    "bvc": "dist/bun-vlessclient.js",
+    "bun-vlessclient": "dist/bun-vlessclient.js"
+  },
+  "scripts": {
+    "build": "bun build ./bun-vlessclient.ts --outdir ./dist --target bun --minify",
+    "start": "bun run dist/bun-vlessclient.js"
+  },
+  "keywords": [
+    "bun",
+    "vless",
+    "client",
+    "socks5",
+    "proxy"
+  ],
+  "license": "MIT",
+  "engines": {
+    "bun": ">=1.0.0"
+  }
+}
