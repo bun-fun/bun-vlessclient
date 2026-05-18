@@ -6,6 +6,7 @@
 
 import { readFileSync, existsSync } from 'fs';
 import { resolve } from 'path';
+import { version } from './package.json';
 
 // Parse config file path BEFORE anything else
 let configPath = '';
@@ -14,8 +15,13 @@ for (let i = 0; i < args.length; i++) {
     if ((args[i] === '-c' || args[i] === '--config') && i + 1 < args.length) {
         configPath = resolve(args[++i]);
     }
+    if (args[i] === '--version' || args[i] === '-v') {
+        console.log(`bun-vlessclient v${version}`);
+        process.exit(0);
+    }
     if (args[i] === '--help' || args[i] === '-h') {
         console.log('Usage: bvc [-c <config-file>]');
+        console.log('       bvc --version');
         console.log('       bvc --help');
         console.log('Config file format: JSON');
         process.exit(0);
@@ -187,6 +193,16 @@ const SOCKS_CMD_CONNECT = 0x01;
 const SOCKS_ATYPE_IPV4 = 0x01;
 const SOCKS_ATYPE_DOMAIN = 0x03;
 const SOCKS_ATYPE_IPV6 = 0x04;
+
+/**
+ * SOCKS4 Protocol Constants
+ */
+const SOCKS4_VERSION = 0x04;
+const SOCKS4_CMD_CONNECT = 0x01;
+const SOCKS4_REPLY_GRANTED = 0x5A;
+const SOCKS4_REPLY_REJECTED = 0x5B;
+const SOCKS4_REPLY_BIND = 0x5C;
+const SOCKS4_REPLY_IDENTD_FAIL = 0x5D;
 const VLESS_ATYPE_IPV4 = 0x01;
 const VLESS_ATYPE_DOMAIN = 0x02;
 const VLESS_ATYPE_IPV6 = 0x03;
@@ -196,6 +212,7 @@ const VLESS_ATYPE_IPV6 = 0x03;
  */
 interface Session {
     state: 'greeting' | 'request' | 'forwarding';
+    socksType: 'socks4' | 'socks5';
     ws?: WebSocket;
     destHost?: string;
     destPort?: number;
@@ -227,9 +244,14 @@ class BunVLESSClient {
                     try {
                         if (session.state === 'forwarding') {
                             if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+                                const len = data.byteLength ?? data.length ?? 0;
+                                log('debug', `[DATA→WS] forwarding ${len} bytes to ${session.destHost}:${session.destPort} (ws.readyState=${session.ws.readyState})`);
                                 session.ws.send(data);
+                                session.bytesSentToWs = (session.bytesSentToWs || 0) + len;
                             } else {
                                 // Buffer data if WS is not ready yet (Early Data)
+                                const len = data.byteLength ?? data.length ?? 0;
+                                log('debug', `[DATA→WS] buffering ${len} bytes (ws state=${session.ws?.readyState ?? 'none'})`);
                                 session.pendingData = session.pendingData ? concatUint8Arrays(session.pendingData, data) : data;
                             }
                         } else if (session.state === 'greeting') {
@@ -245,6 +267,7 @@ class BunVLESSClient {
                 open(socket) {
                     socket.data = { 
                         state: 'greeting',
+                        socksType: 'socks5',
                         responseHeaderBytesSkipped: 0,
                         firstRemotePayloadReceived: false,
                         socksReplySent: false
@@ -265,7 +288,7 @@ class BunVLESSClient {
 }
 
 /**
- * SOCKS5 Greeting Handler
+ * Greeting Handler - detects SOCKS4 vs SOCKS5
  */
 async function handleSocksGreeting(socket: any, data: Uint8Array, session: Session) {
     const currentData = session.socksBuffer ? concatUint8Arrays(session.socksBuffer, data) : data;
@@ -275,8 +298,20 @@ async function handleSocksGreeting(socket: any, data: Uint8Array, session: Sessi
         return;
     }
 
-    if (currentData[0] !== SOCKS_VERSION) {
-        throw new Error(`Invalid SOCKS version: ${currentData[0]}`);
+    const version = currentData[0];
+
+    // SOCKS4: no greeting phase, parse directly as a request
+    if (version === SOCKS4_VERSION) {
+        session.socksType = 'socks4';
+        session.socksBuffer = undefined;
+        session.state = 'request';
+        await handleSocks4Request(socket, currentData, session);
+        return;
+    }
+
+    // SOCKS5 greeting
+    if (version !== SOCKS_VERSION) {
+        throw new Error(`Invalid SOCKS version: ${version}`);
     }
 
     const numMethods = currentData[1];
@@ -354,11 +389,118 @@ async function handleSocksRequest(socket: any, data: Uint8Array, session: Sessio
 
     log('info', `SOCKS5 CONNECT: ${host}:${port}${remaining.length > 0 ? ` (+${remaining.length} bytes early data)` : ''}`);
 
-    // --- Connect using Native WebSocket ---
+    const vlessAType = mapSocksATypeToVless(atype);
+    const addrPortBuf = currentData.subarray(3, offset);
+    await establishVlessConnection(socket, session, host, port, vlessAType, addrPortBuf);
+}
+
+/**
+ * SOCKS4 / SOCKS4a Request Handler
+ */
+async function handleSocks4Request(socket: any, data: Uint8Array, session: Session) {
+    const currentData = session.socksBuffer ? concatUint8Arrays(session.socksBuffer, data) : data;
+
+    // Minimum SOCKS4 request: ver(1) + cmd(1) + port(2) + ip(4) = 8 bytes
+    if (currentData.length < 8) {
+        session.socksBuffer = currentData;
+        return;
+    }
+
+    if (currentData[0] !== SOCKS4_VERSION) {
+        throw new Error(`Invalid SOCKS4 version: ${currentData[0]}`);
+    }
+
+    if (currentData[1] !== SOCKS4_CMD_CONNECT) {
+        throw new Error(`Unsupported SOCKS4 command: ${currentData[1]}`);
+    }
+
+    const port = (currentData[2] << 8) | currentData[3];
+    const ipBytes = currentData.subarray(4, 8);
+
+    // Find null-terminated user ID (starts at byte 8)
+    let userIdEnd = 8;
+    while (userIdEnd < currentData.length && currentData[userIdEnd] !== 0) userIdEnd++;
+    if (userIdEnd >= currentData.length) {
+        session.socksBuffer = currentData;
+        return;
+    }
+    // userId is informational, we don't use it for auth in this client
+    // const userId = new TextDecoder().decode(currentData.subarray(8, userIdEnd));
+    let offset = userIdEnd + 1;
+
+    let host: string;
+    let atype: number;
+
+    // SOCKS4a: if IP is 0.0.0.x (x != 0), domain follows user ID
+    if (ipBytes[0] === 0 && ipBytes[1] === 0 && ipBytes[2] === 0 && ipBytes[3] !== 0) {
+        if (offset >= currentData.length) {
+            session.socksBuffer = currentData;
+            return;
+        }
+        const domainEnd = currentData.indexOf(0, offset);
+        if (domainEnd < 0) {
+            session.socksBuffer = currentData;
+            return;
+        }
+        host = new TextDecoder().decode(currentData.subarray(offset, domainEnd));
+        offset = domainEnd + 1;
+        atype = SOCKS_ATYPE_DOMAIN;
+    } else {
+        host = ipBytes.join('.');
+        atype = SOCKS_ATYPE_IPV4;
+    }
+
+    session.destHost = host;
+    session.destPort = port;
+    session.socksBuffer = undefined;
+    // Store first 8 bytes (ver, cmd, port, ip) as template for SOCKS4 reply
+    session.socksRequestData = currentData.subarray(0, 8);
+    session.socksRequestOffset = 8;
+
+    const remaining = currentData.subarray(offset);
+    if (remaining.length > 0) {
+        session.pendingData = session.pendingData ? concatUint8Arrays(session.pendingData, remaining) : remaining;
+    }
+
+    log('info', `SOCKS4${atype === SOCKS_ATYPE_DOMAIN ? 'a' : ''} CONNECT: ${host}:${port}${remaining.length > 0 ? ` (+${remaining.length} bytes early data)` : ''}`);
+
+    // Build addrPortBuf for VLESS header: [socks_atype, ...addr..., port_hi, port_lo]
+    let addrPortBuf: Uint8Array;
+    const vlessAType = (atype === SOCKS_ATYPE_DOMAIN) ? VLESS_ATYPE_DOMAIN : VLESS_ATYPE_IPV4;
+
+    if (atype === SOCKS_ATYPE_DOMAIN) {
+        const domainBytes = new TextEncoder().encode(host);
+        addrPortBuf = new Uint8Array(1 + 1 + domainBytes.length + 2);
+        addrPortBuf[0] = SOCKS_ATYPE_DOMAIN;
+        addrPortBuf[1] = domainBytes.length;
+        addrPortBuf.set(domainBytes, 2);
+        addrPortBuf[2 + domainBytes.length] = (port >> 8) & 0xff;
+        addrPortBuf[2 + domainBytes.length + 1] = port & 0xff;
+    } else {
+        addrPortBuf = new Uint8Array(1 + 4 + 2);
+        addrPortBuf[0] = SOCKS_ATYPE_IPV4;
+        addrPortBuf.set(ipBytes, 1);
+        addrPortBuf[5] = (port >> 8) & 0xff;
+        addrPortBuf[6] = port & 0xff;
+    }
+
+    await establishVlessConnection(socket, session, host, port, vlessAType, addrPortBuf);
+}
+
+/**
+ * Shared VLESS WebSocket connection logic for both SOCKS4 and SOCKS5
+ */
+async function establishVlessConnection(
+    socket: any,
+    session: Session,
+    host: string,
+    port: number,
+    vlessAType: number,
+    addrPortBuf: Uint8Array,
+) {
     const protocol = OUTBOUND.tls?.enabled ? 'wss' : 'ws';
     const wsUrl = `${protocol}://${OUTBOUND.server}:${OUTBOUND.server_port}${OUTBOUND.transport?.path}`;
-    const vlessAType = mapSocksATypeToVless(atype);
-    
+
     try {
         const ws = new WebSocket(wsUrl, {
             headers: {
@@ -371,7 +513,7 @@ async function handleSocksRequest(socket: any, data: Uint8Array, session: Sessio
                 serverName: OUTBOUND.tls?.server_name || OUTBOUND.server,
             } : undefined
         });
-        
+
         ws.binaryType = "arraybuffer";
         session.ws = ws;
 
@@ -386,20 +528,18 @@ async function handleSocksRequest(socket: any, data: Uint8Array, session: Sessio
 
         ws.onopen = () => {
             clearTimeout(timeout);
-            
-            // Many VLESS-WS servers expect the first websocket message to contain
-            // both the VLESS header and the first TCP payload if early data exists.
-            const vlessHeader = createVlessHeader(port, vlessAType, currentData.subarray(3, offset));
+
+            // VLESS header + early data
+            const vlessHeader = createVlessHeader(port, vlessAType, addrPortBuf);
             const firstFramePayload = session.pendingData && session.pendingData.length > 0
                 ? concatUint8Arrays(vlessHeader, session.pendingData)
                 : vlessHeader;
             ws.send(firstFramePayload);
 
-            // 2. Reply SOCKS success
+            // Reply SOCKS success (format depends on socksType)
             markSocksSuccess(socket, session);
-            
+
             session.pendingData = undefined;
-            
             session.state = 'forwarding';
         };
 
@@ -412,28 +552,43 @@ async function handleSocksRequest(socket: any, data: Uint8Array, session: Sessio
 
             session.firstRemotePayloadReceived = true;
             let payload = normalized;
-            
+
+            log('debug', `[WS→DATA] received ${payload.length} bytes (headerSkipped=${session.responseHeaderBytesSkipped})`);
+
             // VLESS response header is 2 bytes at the start of the stream
             if (session.responseHeaderBytesSkipped < 2) {
                 const toSkip = 2 - session.responseHeaderBytesSkipped;
                 if (payload.length <= toSkip) {
+                    log('debug', `[WS→DATA] skipping ${payload.length} VLESS header bytes (${session.responseHeaderBytesSkipped}/${2})`);
+                    if (session.responseHeaderBytesSkipped === 0 && payload.length >= 1) {
+                        log('info', `VLESS response: 0x${payload[0].toString(16).padStart(2, '0')} ${payload.length >= 2 ? '0x' + payload[1].toString(16).padStart(2, '0') : '?'}`);
+                    }
                     session.responseHeaderBytesSkipped += payload.length;
                     return;
                 } else {
+                    const skipped = toSkip;
+                    // Log the VLESS response bytes before skipping
+                    log('info', `VLESS response: 0x${payload[0].toString(16).padStart(2, '0')} 0x${payload[1].toString(16).padStart(2, '0')} (${payload.length - toSkip} bytes payload following)`);
                     payload = payload.subarray(toSkip);
                     session.responseHeaderBytesSkipped = 2;
+                    log('debug', `[WS→DATA] skipped ${skipped} VLESS header bytes, ${payload.length} bytes payload remaining`);
                 }
             }
-            
+
             if (payload.length > 0) {
-                socket.write(payload);
+                log('debug', `[WS→SOCKET] writing ${payload.length} bytes to local socket`);
+                const written = socket.write(payload);
+                session.bytesReceivedFromWs = (session.bytesReceivedFromWs || 0) + payload.length;
             }
         };
 
         ws.onclose = (event) => {
+            const sent = session.bytesSentToWs ?? 0;
+            const recv = session.bytesReceivedFromWs ?? 0;
             log(
                 session.firstRemotePayloadReceived ? 'debug' : 'warn',
-                `Remote WS closed for ${host}:${port} (code=${event.code}, clean=${event.wasClean}, reason=${event.reason || 'none'}, firstPayload=${session.firstRemotePayloadReceived ? 'yes' : 'no'})`
+                `Remote WS closed for ${host}:${port} (code=${event.code}, clean=${event.wasClean}, reason=${event.reason || 'none'}, firstPayload=${session.firstRemotePayloadReceived ? 'yes' : 'no'})` +
+                ` traffic: ↑${sent} ↓${recv}`
             );
             socket.end();
         };
@@ -454,12 +609,28 @@ async function handleSocksRequest(socket: any, data: Uint8Array, session: Sessio
 }
 
 /**
- * Send SOCKS5 error reply
+ * Send SOCKS error reply (SOCKS4 or SOCKS5)
  */
 function sendSocksError(socket: any, session: Session) {
     if (session.socksReplySent) {
         return;
     }
+
+    if (session.socksType === 'socks4') {
+        // SOCKS4 error reply: [0x00, 0x5B, port_hi, port_lo, 0, 0, 0, 0]
+        const reply = new Uint8Array(8);
+        reply[0] = 0x00;
+        reply[1] = SOCKS4_REPLY_REJECTED;
+        if (session.destPort !== undefined) {
+            reply[2] = (session.destPort >> 8) & 0xff;
+            reply[3] = session.destPort & 0xff;
+        }
+        socket.write(reply);
+        session.socksReplySent = true;
+        return;
+    }
+
+    // SOCKS5 error
     if (session.socksRequestData && session.socksRequestOffset) {
         const reply = new Uint8Array(session.socksRequestOffset);
         reply.set(session.socksRequestData);
@@ -477,6 +648,26 @@ function markSocksSuccess(socket: any, session: Session) {
     if (session.socksReplySent || !session.socksRequestData || !session.socksRequestOffset) {
         return;
     }
+
+    if (session.socksType === 'socks4') {
+        // SOCKS4 success reply: [0x00, 0x5A, port_hi, port_lo, ip1, ip2, ip3, ip4]
+        // Copy port and IP from the original request (first 8 bytes)
+        const reply = new Uint8Array(8);
+        reply[0] = 0x00;
+        reply[1] = SOCKS4_REPLY_GRANTED;
+        reply[2] = session.socksRequestData[2];
+        reply[3] = session.socksRequestData[3];
+        reply[4] = session.socksRequestData[4];
+        reply[5] = session.socksRequestData[5];
+        reply[6] = session.socksRequestData[6];
+        reply[7] = session.socksRequestData[7];
+        socket.write(reply);
+        session.socksRequestData = undefined;
+        session.socksReplySent = true;
+        return;
+    }
+
+    // SOCKS5 success
     const reply = new Uint8Array(session.socksRequestOffset);
     reply.set(session.socksRequestData);
     reply[1] = 0x00;
