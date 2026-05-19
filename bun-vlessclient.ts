@@ -212,7 +212,7 @@ const VLESS_ATYPE_IPV6 = 0x03;
  */
 interface Session {
     state: 'greeting' | 'request' | 'forwarding';
-    socksType: 'socks4' | 'socks5';
+    socksType: 'socks4' | 'socks5' | 'http';
     ws?: WebSocket;
     destHost?: string;
     destPort?: number;
@@ -223,6 +223,9 @@ interface Session {
     pendingData?: Uint8Array;
     firstRemotePayloadReceived?: boolean;
     socksReplySent?: boolean;
+    httpMethod?: string;
+    bytesSentToWs: number;
+    bytesReceivedFromWs: number;
 }
 
 /**
@@ -232,58 +235,83 @@ class BunVLESSClient {
     start() {
         log('info', `Starting local SOCKS5 proxy on port ${LOCAL_PORT}`);
         log('info', `Outbound: ${OUTBOUND.server}:${OUTBOUND.server_port} (Native WebSocket)`);
-        
-        Bun.listen({
-            hostname: "0.0.0.0",
-            port: LOCAL_PORT,
-            socket: {
-                async data(socket, data) {
-                    const session = socket.data as unknown as Session;
-                    if (!session) return;
 
-                    try {
-                        if (session.state === 'forwarding') {
-                            if (session.ws && session.ws.readyState === WebSocket.OPEN) {
-                                const len = data.byteLength ?? data.length ?? 0;
-                                log('debug', `[DATA→WS] forwarding ${len} bytes to ${session.destHost}:${session.destPort} (ws.readyState=${session.ws.readyState})`);
-                                session.ws.send(data);
-                                session.bytesSentToWs = (session.bytesSentToWs || 0) + len;
-                            } else {
-                                // Buffer data if WS is not ready yet (Early Data)
-                                const len = data.byteLength ?? data.length ?? 0;
-                                log('debug', `[DATA→WS] buffering ${len} bytes (ws state=${session.ws?.readyState ?? 'none'})`);
-                                session.pendingData = session.pendingData ? concatUint8Arrays(session.pendingData, data) : data;
-                            }
-                        } else if (session.state === 'greeting') {
-                            await handleSocksGreeting(socket, data, session);
-                        } else if (session.state === 'request') {
+        const socketHandlers = {
+            async data(socket: any, data: Uint8Array) {
+                const session = socket.data as unknown as Session;
+                if (!session) return;
+
+                try {
+                    if (session.state === 'forwarding') {
+                        if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+                            const len = data.byteLength ?? data.length ?? 0;
+                            log('debug', `[DATA→WS] forwarding ${len} bytes to ${session.destHost}:${session.destPort} (ws.readyState=${session.ws.readyState})`);
+                            session.ws.send(data);
+                            session.bytesSentToWs = (session.bytesSentToWs || 0) + len;
+                        } else {
+                            const len = data.byteLength ?? data.length ?? 0;
+                            log('debug', `[DATA→WS] buffering ${len} bytes (ws state=${session.ws?.readyState ?? 'none'})`);
+                            session.pendingData = session.pendingData ? concatUint8Arrays(session.pendingData, data) : data;
+                        }
+                    } else if (session.state === 'greeting') {
+                        await handleSocksGreeting(socket, data, session);
+                    } else if (session.state === 'request') {
+                        if (session.socksType === 'http') {
+                            await handleHttpProxyRequest(socket, data, session);
+                        } else {
                             await handleSocksRequest(socket, data, session);
                         }
-                    } catch (err: any) {
-                        log('error', `Session error: ${err.message}`);
-                        socket.end();
                     }
-                },
-                open(socket) {
-                    socket.data = { 
-                        state: 'greeting',
-                        socksType: 'socks5',
-                        responseHeaderBytesSkipped: 0,
-                        firstRemotePayloadReceived: false,
-                        socksReplySent: false
-                    };
-                },
-                close(socket) {
-                    const session = socket.data as unknown as Session;
-                    if (session?.ws) {
-                        session.ws.close();
-                    }
-                },
-                error(socket, error) {
-                    log('error', `Socket error: ${error.message}`);
+                } catch (err: any) {
+                    log('error', `Session error: ${err.message}`);
+                    socket.end();
                 }
+            },
+            open(socket: any) {
+                socket.data = { 
+                    state: 'greeting',
+                    socksType: 'socks5',
+                    responseHeaderBytesSkipped: 0,
+                    firstRemotePayloadReceived: false,
+                    socksReplySent: false,
+                    bytesSentToWs: 0,
+                    bytesReceivedFromWs: 0,
+                };
+            },
+            close(socket: any) {
+                const session = socket.data as unknown as Session;
+                if (session?.ws) {
+                    session.ws.close();
+                }
+            },
+            error(socket: any, error: Error) {
+                log('error', `Socket error: ${error.message}`);
             }
-        });
+        };
+
+        let ipv4Ok = false;
+        let ipv6Ok = false;
+
+        try {
+            Bun.listen({ hostname: "0.0.0.0", port: LOCAL_PORT, socket: socketHandlers });
+            ipv4Ok = true;
+            log('info', `Listening on IPv4 0.0.0.0:${LOCAL_PORT}`);
+        } catch (e: any) {
+            log('warn', `Cannot listen on IPv4: ${e.message}`);
+        }
+
+        try {
+            Bun.listen({ hostname: "::", port: LOCAL_PORT, socket: socketHandlers });
+            ipv6Ok = true;
+            log('info', `Listening on IPv6 [::]:${LOCAL_PORT}`);
+        } catch (e: any) {
+            log('warn', `Cannot listen on IPv6: ${e.message}`);
+        }
+
+        if (!ipv4Ok && !ipv6Ok) {
+            log('error', 'Failed to listen on any address');
+            process.exit(1);
+        }
     }
 }
 
@@ -309,8 +337,20 @@ async function handleSocksGreeting(socket: any, data: Uint8Array, session: Sessi
         return;
     }
 
-    // SOCKS5 greeting
+    // HTTP Proxy detection: if not SOCKS5, check for ASCII HTTP methods
     if (version !== SOCKS_VERSION) {
+        if (currentData.length < 12) {
+            session.socksBuffer = currentData;
+            return;
+        }
+        const prefix = new TextDecoder().decode(currentData.subarray(0, 12));
+        if (/^(CONNECT|GET|POST|PUT|DELETE|HEAD|OPTIONS|PATCH|TRACE) /.test(prefix)) {
+            session.socksType = 'http';
+            session.socksBuffer = undefined;
+            session.state = 'request';
+            await handleHttpProxyRequest(socket, currentData, session);
+            return;
+        }
         throw new Error(`Invalid SOCKS version: ${version}`);
     }
 
@@ -488,6 +528,106 @@ async function handleSocks4Request(socket: any, data: Uint8Array, session: Sessi
 }
 
 /**
+ * HTTP Proxy Request Handler (CONNECT + non-CONNECT methods)
+ */
+async function handleHttpProxyRequest(socket: any, data: Uint8Array, session: Session) {
+    const currentData = session.socksBuffer ? concatUint8Arrays(session.socksBuffer, data) : data;
+    const headerText = new TextDecoder().decode(currentData);
+
+    const headerEnd = headerText.indexOf('\r\n\r\n');
+    if (headerEnd < 0) {
+        session.socksBuffer = currentData;
+        return;
+    }
+
+    const body = currentData.subarray(headerEnd + 4);
+    const lines = headerText.split('\r\n');
+    const requestLine = lines[0];
+    const parts = requestLine.split(' ');
+
+    if (parts.length < 3) {
+        socket.write(new TextEncoder().encode('HTTP/1.1 400 Bad Request\r\n\r\n'));
+        socket.end();
+        return;
+    }
+
+    const method = parts[0];
+    const uri = parts[1];
+    const httpVersion = parts[2];
+    session.httpMethod = method;
+
+    log('debug', `[HTTP REQUEST] ${requestLine} (${lines.length - 1} headers, ${body.length} body bytes)`);
+
+    if (method === 'CONNECT') {
+        const [host, portStr] = uri.split(':');
+        const port = parseInt(portStr, 10);
+        if (!host || isNaN(port)) {
+            socket.write(new TextEncoder().encode('HTTP/1.1 400 Bad Request\r\n\r\n'));
+            socket.end();
+            return;
+        }
+
+        log('info', `HTTP CONNECT: ${host}:${port}${body.length > 0 ? ` (+${body.length} bytes early data)` : ''}`);
+
+        session.destHost = host;
+        session.destPort = port;
+        session.socksBuffer = undefined;
+
+        if (body.length > 0) {
+            log('debug', `[HTTP CONNECT] storing ${body.length} bytes early data`);
+            session.pendingData = session.pendingData ? concatUint8Arrays(session.pendingData, body) : body;
+        }
+
+        const hostBytes = new TextEncoder().encode(host);
+        const addrPortBuf = new Uint8Array(1 + 1 + hostBytes.length + 2);
+        addrPortBuf[0] = SOCKS_ATYPE_DOMAIN;
+        addrPortBuf[1] = hostBytes.length;
+        addrPortBuf.set(hostBytes, 2);
+        addrPortBuf[2 + hostBytes.length] = (port >> 8) & 0xff;
+        addrPortBuf[2 + hostBytes.length + 1] = port & 0xff;
+
+        await establishVlessConnection(socket, session, host, port, VLESS_ATYPE_DOMAIN, addrPortBuf);
+    } else {
+        const urlMatch = uri.match(/^https?:\/\/([^:\/]+)(?::(\d+))?(\/.*)?$/i);
+        if (!urlMatch) {
+            log('warn', `Invalid HTTP proxy URI: ${uri}`);
+            socket.write(new TextEncoder().encode('HTTP/1.1 400 Bad Request\r\n\r\n'));
+            socket.end();
+            return;
+        }
+
+        const host = urlMatch[1];
+        const port = urlMatch[2] ? parseInt(urlMatch[2], 10) : (uri.startsWith('https') ? 443 : 80);
+        const path = urlMatch[3] || '/';
+
+        const rewrittenFirstLine = `${method} ${path} ${httpVersion}`;
+        const restOfHeader = headerText.substring(headerText.indexOf('\r\n'), headerEnd + 4);
+        const rewrittenRequest = rewrittenFirstLine + restOfHeader;
+
+        log('info', `HTTP ${method}: ${host}:${port}${path}`);
+        log('debug', `[HTTP REWRITE]\n${rewrittenRequest.trimEnd()}`);
+
+        session.destHost = host;
+        session.destPort = port;
+        session.socksBuffer = undefined;
+
+        const rewrittenData = new TextEncoder().encode(rewrittenRequest);
+        const fullPendingData = body.length > 0 ? concatUint8Arrays(rewrittenData, body) : rewrittenData;
+        session.pendingData = session.pendingData ? concatUint8Arrays(session.pendingData, fullPendingData) : fullPendingData;
+
+        const hostBytes = new TextEncoder().encode(host);
+        const addrPortBuf = new Uint8Array(1 + 1 + hostBytes.length + 2);
+        addrPortBuf[0] = SOCKS_ATYPE_DOMAIN;
+        addrPortBuf[1] = hostBytes.length;
+        addrPortBuf.set(hostBytes, 2);
+        addrPortBuf[2 + hostBytes.length] = (port >> 8) & 0xff;
+        addrPortBuf[2 + hostBytes.length + 1] = port & 0xff;
+
+        await establishVlessConnection(socket, session, host, port, VLESS_ATYPE_DOMAIN, addrPortBuf);
+    }
+}
+
+/**
  * Shared VLESS WebSocket connection logic for both SOCKS4 and SOCKS5
  */
 async function establishVlessConnection(
@@ -536,11 +676,16 @@ async function establishVlessConnection(
                 : vlessHeader;
             ws.send(firstFramePayload);
 
-            // Reply SOCKS success (format depends on socksType)
-            markSocksSuccess(socket, session);
+            // Reply success (format depends on protocol type)
+            if (session.socksType === 'http') {
+                markHttpProxySuccess(socket, session);
+            } else {
+                markSocksSuccess(socket, session);
+            }
 
             session.pendingData = undefined;
             session.state = 'forwarding';
+            log('info', `[CONNECTED] ${session.socksType.toUpperCase()} ${host}:${port}`);
         };
 
         ws.onmessage = async (event) => {
@@ -576,7 +721,12 @@ async function establishVlessConnection(
             }
 
             if (payload.length > 0) {
-                log('debug', `[WS→SOCKET] writing ${payload.length} bytes to local socket`);
+                let prefix = '';
+                if (session.socksType === 'http' && payload.length > 0) {
+                    const preview = new TextDecoder().decode(payload.subarray(0, Math.min(60, payload.length)));
+                    prefix = ` first="${preview.replace(/\r\n/g, '\\r\\n')}"`;
+                }
+                log('debug', `[WS→SOCKET] writing ${payload.length} bytes${prefix} to local socket`);
                 const written = socket.write(payload);
                 session.bytesReceivedFromWs = (session.bytesReceivedFromWs || 0) + payload.length;
             }
@@ -613,6 +763,12 @@ async function establishVlessConnection(
  */
 function sendSocksError(socket: any, session: Session) {
     if (session.socksReplySent) {
+        return;
+    }
+
+    if (session.socksType === 'http') {
+        socket.write(new TextEncoder().encode('HTTP/1.1 502 Bad Gateway\r\n\r\n'));
+        session.socksReplySent = true;
         return;
     }
 
@@ -673,6 +829,17 @@ function markSocksSuccess(socket: any, session: Session) {
     reply[1] = 0x00;
     socket.write(reply);
     session.socksRequestData = undefined;
+    session.socksReplySent = true;
+}
+
+function markHttpProxySuccess(socket: any, session: Session) {
+    if (session.socksReplySent) return;
+    if (session.httpMethod === 'CONNECT') {
+        log('debug', `[HTTP 200] Connection Established for ${session.destHost}:${session.destPort}`);
+        socket.write(new TextEncoder().encode('HTTP/1.1 200 Connection Established\r\n\r\n'));
+    } else {
+        log('debug', `[HTTP NO-REPLY] ${session.httpMethod} ${session.destHost}:${session.destPort} — response will come from remote`);
+    }
     session.socksReplySent = true;
 }
 
