@@ -220,13 +220,13 @@ interface Session {
     ws?: WebSocket;
     destHost?: string;
     destPort?: number;
-    responseHeaderBytesSkipped: number;
     socksBuffer?: Uint8Array;
     socksRequestData?: Uint8Array;
     socksRequestOffset?: number;
     pendingData?: Uint8Array;
     firstRemotePayloadReceived?: boolean;
     socksReplySent?: boolean;
+    vlessResponseVerified?: boolean;
     httpMethod?: string;
     bytesSentToWs: number;
     bytesReceivedFromWs: number;
@@ -247,11 +247,14 @@ class BunVLESSClient {
 
                 try {
                     if (session.state === 'forwarding') {
-                        session.bytesSentToWs += data.length;
-                        debugLog(`client -> ws ${data.length} bytes (${session.destHost || '?'}:${session.destPort || '?'})`);
                         if (session.ws && session.ws.readyState === WebSocket.OPEN) {
+                            const len = data.byteLength ?? data.length ?? 0;
+                            log('debug', `[DATA→WS] forwarding ${len} bytes to ${session.destHost}:${session.destPort} (ws.readyState=${session.ws.readyState})`);
                             session.ws.send(data);
+                            session.bytesSentToWs = (session.bytesSentToWs || 0) + len;
                         } else {
+                            const len = data.byteLength ?? data.length ?? 0;
+                            log('debug', `[DATA→WS] buffering ${len} bytes (ws state=${session.ws?.readyState ?? 'none'})`);
                             session.pendingData = session.pendingData ? concatUint8Arrays(session.pendingData, data) : data;
                         }
                     } else if (session.state === 'greeting') {
@@ -272,9 +275,9 @@ class BunVLESSClient {
                 socket.data = { 
                     state: 'greeting',
                     socksType: 'socks5',
-                    responseHeaderBytesSkipped: 0,
                     firstRemotePayloadReceived: false,
                     socksReplySent: false,
+                    vlessResponseVerified: false,
                     bytesSentToWs: 0,
                     bytesReceivedFromWs: 0,
                 };
@@ -575,6 +578,7 @@ async function handleHttpProxyRequest(socket: any, data: Uint8Array, session: Se
         session.socksBuffer = undefined;
 
         if (body.length > 0) {
+            log('debug', `[HTTP CONNECT] storing ${body.length} bytes early data`);
             session.pendingData = session.pendingData ? concatUint8Arrays(session.pendingData, body) : body;
         }
 
@@ -678,15 +682,9 @@ async function establishVlessConnection(
                 ws.send(earlyData);
             }
 
-            // Reply success (format depends on protocol type)
-            if (session.socksType === 'http') {
-                markHttpProxySuccess(socket, session);
-            } else {
-                markSocksSuccess(socket, session);
-            }
-
+            session.pendingData = undefined;
             session.state = 'forwarding';
-            log('info', `[CONNECTED] ${session.socksType.toUpperCase()} ${host}:${port}`);
+            log('info', `[WS OPEN] ${session.socksType.toUpperCase()} ${host}:${port} - waiting VLESS response`);
         };
 
         ws.onmessage = async (event) => {
@@ -697,24 +695,49 @@ async function establishVlessConnection(
             }
 
             session.firstRemotePayloadReceived = true;
-            let payload = normalized;
-            debugLog(`ws message ${payload.length} bytes (${session.destHost || '?'}:${session.destPort || '?'}) first=${payload.subarray(0, 8).join(',')}`);
 
-            if (session.responseHeaderBytesSkipped < 2) {
-                const toSkip = 2 - session.responseHeaderBytesSkipped;
-                if (payload.length <= toSkip) {
-                    session.responseHeaderBytesSkipped += payload.length;
+            if (!session.vlessResponseVerified) {
+                if (normalized.length < 2) {
+                    log('error', `VLESS response too short: ${normalized.length} bytes for ${host}:${port}`);
+                    sendSocksError(socket, session);
+                    socket.end();
                     return;
-                } else {
-                    payload = payload.subarray(toSkip);
-                    session.responseHeaderBytesSkipped = 2;
                 }
+
+                const vlessStatus = normalized[1];
+                if (vlessStatus !== 0) {
+                    log('error', `VLESS rejected ${host}:${port}, status=${vlessStatus}`);
+                    sendSocksError(socket, session);
+                    socket.end();
+                    return;
+                }
+
+                session.vlessResponseVerified = true;
+
+                if (session.socksType === 'http') {
+                    markHttpProxySuccess(socket, session);
+                } else {
+                    markSocksSuccess(socket, session);
+                }
+
+                const payload = normalized.subarray(2);
+                if (payload.length > 0) {
+                    let prefix = '';
+                    if (session.socksType === 'http') {
+                        const preview = new TextDecoder().decode(payload.subarray(0, Math.min(60, payload.length)));
+                        prefix = ` first="${preview.replace(/\r\n/g, '\\r\\n')}"`;
+                    }
+                    log('debug', `[WS→SOCKET] writing ${payload.length} bytes${prefix} to local socket`);
+                    socket.write(payload);
+                    session.bytesReceivedFromWs = (session.bytesReceivedFromWs || 0) + payload.length;
+                }
+                return;
             }
 
-            if (payload.length > 0) {
-                session.bytesReceivedFromWs += payload.length;
-                debugLog(`ws -> socket ${payload.length} bytes (${session.destHost || '?'}:${session.destPort || '?'}) first=${payload.subarray(0, 8).join(',')}`);
-                socket.write(payload);
+            if (normalized.length > 0) {
+                log('debug', `[WS→SOCKET] writing ${normalized.length} bytes to local socket`);
+                socket.write(normalized);
+                session.bytesReceivedFromWs = (session.bytesReceivedFromWs || 0) + normalized.length;
             }
         };
 
@@ -822,7 +845,10 @@ function markSocksSuccess(socket: any, session: Session) {
 function markHttpProxySuccess(socket: any, session: Session) {
     if (session.socksReplySent) return;
     if (session.httpMethod === 'CONNECT') {
+        log('debug', `[HTTP 200] Connection Established for ${session.destHost}:${session.destPort}`);
         socket.write(new TextEncoder().encode('HTTP/1.1 200 Connection Established\r\n\r\n'));
+    } else {
+        log('debug', `[HTTP NO-REPLY] ${session.httpMethod} ${session.destHost}:${session.destPort} — response will come from remote`);
     }
     session.socksReplySent = true;
 }
