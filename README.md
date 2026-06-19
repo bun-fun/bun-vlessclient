@@ -74,7 +74,7 @@ For Git over HTTP proxy:
 ```powershell
 $env:HTTPS_PROXY='http://127.0.0.1:1080'
 $env:HTTP_PROXY='http://127.0.0.1:1080'
-git clone https://github.com/xuzhougeng/wispterm.git
+git clone https://github.com/bun-fun/bun-vlessclient.git
 ```
 
 For Git over SOCKS5 proxy:
@@ -83,7 +83,7 @@ For Git over SOCKS5 proxy:
 $env:HTTPS_PROXY='socks5h://127.0.0.1:1080'
 $env:HTTP_PROXY='socks5h://127.0.0.1:1080'
 $env:ALL_PROXY='socks5h://127.0.0.1:1080'
-git clone https://github.com/xuzhougeng/wispterm.git
+git clone https://github.com/bun-fun/bun-vlessclient.git
 ```
 
 Use `socks5h://` when DNS resolution should also go through the proxy.
