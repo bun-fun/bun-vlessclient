@@ -62,6 +62,31 @@ function loadConfig(path: string): Config | null {
 
 const cfg = loadConfig(configPath);
 
+// --- Logger ---
+type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'none';
+const LOG_LEVEL = cfgStr('log_level', 'LOG_LEVEL', 'debug') as LogLevel;
+const LOG_LEVEL_RANK: Record<LogLevel, number> = {
+    none: 0, error: 1, warn: 2, info: 3, debug: 4,
+};
+const LOG_LEVELS_MAP: Record<string, { color: string; label: string }> = {
+    debug: { color: '\x1b[36m', label: '[DEBUG]' },
+    info: { color: '\x1b[32m', label: '[INFO] ' },
+    warn: { color: '\x1b[33m', label: '[WARN] ' },
+    error: { color: '\x1b[31m', label: '[ERROR]' },
+};
+const log = LOG_LEVEL === 'none'
+    ? function (_level: string, ..._args: any[]) {}
+    : function (level: 'debug' | 'info' | 'warn' | 'error', ...args: any[]) {
+        if (LOG_LEVEL_RANK[level] > LOG_LEVEL_RANK[LOG_LEVEL]) return;
+        const time = new Date().toISOString().split('T')[1].split('.')[0];
+        const { color, label } = LOG_LEVELS_MAP[level];
+        console.log(`${color}[${time}] ${label}\x1b[0m`, ...args);
+    };
+
+function debugLog(message: string) {
+    log('debug', message);
+}
+
 // --- Config helpers: cfg > env > default ---
 function cfgStr(key: string, envKey: string, def: string): string {
     const parts = key.split('.');
@@ -84,27 +109,6 @@ function cfgBool(key: string, envKey: string, def: boolean): boolean {
     if (ev !== undefined) return ev === 'true';
     return def;
 }
-
-// --- Logger ---
-type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'none';
-const LOG_LEVEL = cfgStr('log_level', 'LOG_LEVEL', 'debug') as LogLevel;
-const LOG_LEVEL_RANK: Record<LogLevel, number> = {
-    none: 0, error: 1, warn: 2, info: 3, debug: 4,
-};
-const LOG_LEVELS_MAP: Record<string, { color: string; label: string }> = {
-    debug: { color: '\x1b[36m', label: '[DEBUG]' },
-    info: { color: '\x1b[32m', label: '[INFO] ' },
-    warn: { color: '\x1b[33m', label: '[WARN] ' },
-    error: { color: '\x1b[31m', label: '[ERROR]' },
-};
-const log = LOG_LEVEL === 'none'
-    ? function (_level: string, ..._args: any[]) {}
-    : function (level: 'debug' | 'info' | 'warn' | 'error', ...args: any[]) {
-        if (LOG_LEVEL_RANK[level] > LOG_LEVEL_RANK[LOG_LEVEL]) return;
-        const time = new Date().toISOString().split('T')[1].split('.')[0];
-        const { color, label } = LOG_LEVELS_MAP[level];
-        console.log(`${color}[${time}] ${label}\x1b[0m`, ...args);
-    };
 
 // --- Configuration ---
 interface VlessOutbound {
@@ -243,14 +247,11 @@ class BunVLESSClient {
 
                 try {
                     if (session.state === 'forwarding') {
+                        session.bytesSentToWs += data.length;
+                        debugLog(`client -> ws ${data.length} bytes (${session.destHost || '?'}:${session.destPort || '?'})`);
                         if (session.ws && session.ws.readyState === WebSocket.OPEN) {
-                            const len = data.byteLength ?? data.length ?? 0;
-                            log('debug', `[DATA→WS] forwarding ${len} bytes to ${session.destHost}:${session.destPort} (ws.readyState=${session.ws.readyState})`);
                             session.ws.send(data);
-                            session.bytesSentToWs = (session.bytesSentToWs || 0) + len;
                         } else {
-                            const len = data.byteLength ?? data.length ?? 0;
-                            log('debug', `[DATA→WS] buffering ${len} bytes (ws state=${session.ws?.readyState ?? 'none'})`);
                             session.pendingData = session.pendingData ? concatUint8Arrays(session.pendingData, data) : data;
                         }
                     } else if (session.state === 'greeting') {
@@ -574,7 +575,6 @@ async function handleHttpProxyRequest(socket: any, data: Uint8Array, session: Se
         session.socksBuffer = undefined;
 
         if (body.length > 0) {
-            log('debug', `[HTTP CONNECT] storing ${body.length} bytes early data`);
             session.pendingData = session.pendingData ? concatUint8Arrays(session.pendingData, body) : body;
         }
 
@@ -697,38 +697,23 @@ async function establishVlessConnection(
 
             session.firstRemotePayloadReceived = true;
             let payload = normalized;
+            debugLog(`ws message ${payload.length} bytes (${session.destHost || '?'}:${session.destPort || '?'}) first=${payload.subarray(0, 8).join(',')}`);
 
-            log('debug', `[WS→DATA] received ${payload.length} bytes (headerSkipped=${session.responseHeaderBytesSkipped})`);
-
-            // VLESS response header is 2 bytes at the start of the stream
             if (session.responseHeaderBytesSkipped < 2) {
                 const toSkip = 2 - session.responseHeaderBytesSkipped;
                 if (payload.length <= toSkip) {
-                    log('debug', `[WS→DATA] skipping ${payload.length} VLESS header bytes (${session.responseHeaderBytesSkipped}/${2})`);
-                    if (session.responseHeaderBytesSkipped === 0 && payload.length >= 1) {
-                        log('info', `VLESS response: 0x${payload[0].toString(16).padStart(2, '0')} ${payload.length >= 2 ? '0x' + payload[1].toString(16).padStart(2, '0') : '?'}`);
-                    }
                     session.responseHeaderBytesSkipped += payload.length;
                     return;
                 } else {
-                    const skipped = toSkip;
-                    // Log the VLESS response bytes before skipping
-                    log('info', `VLESS response: 0x${payload[0].toString(16).padStart(2, '0')} 0x${payload[1].toString(16).padStart(2, '0')} (${payload.length - toSkip} bytes payload following)`);
                     payload = payload.subarray(toSkip);
                     session.responseHeaderBytesSkipped = 2;
-                    log('debug', `[WS→DATA] skipped ${skipped} VLESS header bytes, ${payload.length} bytes payload remaining`);
                 }
             }
 
             if (payload.length > 0) {
-                let prefix = '';
-                if (session.socksType === 'http' && payload.length > 0) {
-                    const preview = new TextDecoder().decode(payload.subarray(0, Math.min(60, payload.length)));
-                    prefix = ` first="${preview.replace(/\r\n/g, '\\r\\n')}"`;
-                }
-                log('debug', `[WS→SOCKET] writing ${payload.length} bytes${prefix} to local socket`);
-                const written = socket.write(payload);
-                session.bytesReceivedFromWs = (session.bytesReceivedFromWs || 0) + payload.length;
+                session.bytesReceivedFromWs += payload.length;
+                debugLog(`ws -> socket ${payload.length} bytes (${session.destHost || '?'}:${session.destPort || '?'}) first=${payload.subarray(0, 8).join(',')}`);
+                socket.write(payload);
             }
         };
 
@@ -740,6 +725,7 @@ async function establishVlessConnection(
                 `Remote WS closed for ${host}:${port} (code=${event.code}, clean=${event.wasClean}, reason=${event.reason || 'none'}, firstPayload=${session.firstRemotePayloadReceived ? 'yes' : 'no'})` +
                 ` traffic: ↑${sent} ↓${recv}`
             );
+            debugLog(`ws close ${session.destHost || '?'}:${session.destPort || '?'} code=${event.code} reason=${event.reason || ''}`);
             socket.end();
         };
 
@@ -835,10 +821,7 @@ function markSocksSuccess(socket: any, session: Session) {
 function markHttpProxySuccess(socket: any, session: Session) {
     if (session.socksReplySent) return;
     if (session.httpMethod === 'CONNECT') {
-        log('debug', `[HTTP 200] Connection Established for ${session.destHost}:${session.destPort}`);
         socket.write(new TextEncoder().encode('HTTP/1.1 200 Connection Established\r\n\r\n'));
-    } else {
-        log('debug', `[HTTP NO-REPLY] ${session.httpMethod} ${session.destHost}:${session.destPort} — response will come from remote`);
     }
     session.socksReplySent = true;
 }
