@@ -669,12 +669,14 @@ async function establishVlessConnection(
         ws.onopen = () => {
             clearTimeout(timeout);
 
-            // VLESS header + early data
             const vlessHeader = createVlessHeader(port, vlessAType, addrPortBuf);
-            const firstFramePayload = session.pendingData && session.pendingData.length > 0
-                ? concatUint8Arrays(vlessHeader, session.pendingData)
-                : vlessHeader;
-            ws.send(firstFramePayload);
+            ws.send(vlessHeader);
+
+            if (session.pendingData && session.pendingData.length > 0) {
+                const earlyData = session.pendingData;
+                session.pendingData = undefined;
+                ws.send(earlyData);
+            }
 
             // Reply success (format depends on protocol type)
             if (session.socksType === 'http') {
@@ -683,7 +685,6 @@ async function establishVlessConnection(
                 markSocksSuccess(socket, session);
             }
 
-            session.pendingData = undefined;
             session.state = 'forwarding';
             log('info', `[CONNECTED] ${session.socksType.toUpperCase()} ${host}:${port}`);
         };
