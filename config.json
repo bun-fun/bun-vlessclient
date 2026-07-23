@@ -1,5 +1,5 @@
 {
-    "log_level": "debug",
+    "log_level": "info",
     "local_port": 1080,
     "remote": {
         "host": "example.com",

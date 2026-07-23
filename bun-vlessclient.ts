@@ -64,7 +64,7 @@ const cfg = loadConfig(configPath);
 
 // --- Logger ---
 type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'none';
-const LOG_LEVEL = cfgStr('log_level', 'LOG_LEVEL', 'debug') as LogLevel;
+const LOG_LEVEL = cfgStr('log_level', 'LOG_LEVEL', 'info') as LogLevel;
 const LOG_LEVEL_RANK: Record<LogLevel, number> = {
     none: 0, error: 1, warn: 2, info: 3, debug: 4,
 };
@@ -98,7 +98,16 @@ function cfgNum(key: string, envKey: string, def: number): number {
     const parts = key.split('.');
     let o: any = cfg;
     for (const p of parts) if (o) o = o[p];
-    return o ?? parseInt(process.env[envKey] || '') ?? def;
+    if (o !== undefined && o !== null && o !== '') {
+        const n = typeof o === 'number' ? o : parseInt(String(o), 10);
+        if (!Number.isNaN(n)) return n;
+    }
+    const ev = process.env[envKey];
+    if (ev !== undefined && ev !== '') {
+        const n = parseInt(ev, 10);
+        if (!Number.isNaN(n)) return n;
+    }
+    return def;
 }
 function cfgBool(key: string, envKey: string, def: boolean): boolean {
     const parts = key.split('.');
@@ -137,6 +146,15 @@ interface VlessOutbound {
 const LOCAL_PORT = cfgNum('local_port', 'LOCAL_PORT', 1080);
 const WS_TIMEOUT = cfgNum('timeout', 'TIMEOUT', 20000);
 
+/** Pause further local→WS sends when WebSocket outbound buffer exceeds this. */
+const WS_HIGH_WATER = 1024 * 1024; // 1 MiB
+/** Resume local→WS sends once buffer drains to this level. */
+const WS_LOW_WATER = 256 * 1024; // 256 KiB
+/** Max bytes queued waiting for local socket drain (WS→client). */
+const LOCAL_WRITE_QUEUE_MAX = 16 * 1024 * 1024; // 16 MiB
+/** Max bytes of raw WS messages waiting to be applied to the local socket. */
+const WS_MSG_QUEUE_MAX = 16 * 1024 * 1024; // 16 MiB
+
 let OUTBOUND: VlessOutbound = {
     server: cfgStr('remote.host', 'REMOTE_HOST', 'example.com'),
     server_port: cfgNum('remote.port', 'REMOTE_PORT', 443),
@@ -162,6 +180,313 @@ function concatUint8Arrays(a: Uint8Array, b: Uint8Array): Uint8Array {
     res.set(a);
     res.set(b, a.length);
     return res;
+}
+
+function clearWsFlushTimer(session: Session) {
+    if (session.wsFlushTimer) {
+        clearInterval(session.wsFlushTimer);
+        session.wsFlushTimer = undefined;
+    }
+}
+
+function hasPendingLocalOutput(session: Session): boolean {
+    return (
+        (session.localWriteQueuedBytes || 0) > 0 ||
+        (session.wsMsgQueuedBytes || 0) > 0 ||
+        (session.wsMsgQueue?.length ?? 0) > 0 ||
+        (session.localWriteQueue?.length ?? 0) > 0
+    );
+}
+
+/** End local socket after queued WS→client bytes are flushed (or force immediately). */
+function finishLocalSocket(socket: any, session: Session, force = false) {
+    if (session.closed) return;
+    if (!force && hasPendingLocalOutput(session)) {
+        session.remoteClosed = true;
+        return;
+    }
+    session.closed = true;
+    clearWsFlushTimer(session);
+    try {
+        socket.end();
+    } catch {
+        // ignore
+    }
+}
+
+function closeSession(socket: any, session: Session, reason?: string) {
+    if (session.closed) return;
+    if (reason) log('warn', reason);
+    session.closed = true;
+    clearWsFlushTimer(session);
+    try {
+        session.ws?.close();
+    } catch {
+        // ignore
+    }
+    try {
+        socket.end();
+    } catch {
+        // ignore
+    }
+}
+
+/**
+ * Write data to the local client socket with backpressure.
+ * Queues remainder when the kernel buffer is full; drained via `drain` handler.
+ */
+function writeToLocalSocket(socket: any, session: Session, data: Uint8Array): void {
+    if (session.closed || data.length === 0) return;
+
+    if (session.localWriteQueue && session.localWriteQueue.length > 0) {
+        session.localWriteQueue.push(data);
+        session.localWriteQueuedBytes += data.length;
+        if (session.localWriteQueuedBytes > LOCAL_WRITE_QUEUE_MAX) {
+            closeSession(
+                socket,
+                session,
+                `Local write queue overflow for ${session.destHost}:${session.destPort} (${session.localWriteQueuedBytes} bytes)`
+            );
+        }
+        return;
+    }
+
+    let written: number;
+    try {
+        written = socket.write(data);
+    } catch (err: any) {
+        closeSession(socket, session, `Local socket write failed: ${err?.message || err}`);
+        return;
+    }
+
+    // Bun: full write returns byte length; blocked may return -1 or partial count
+    if (written === data.length) {
+        session.bytesReceivedFromWs = (session.bytesReceivedFromWs || 0) + data.length;
+        return;
+    }
+
+    if (written === -1 || written == null || written === 0) {
+        session.localWriteQueue = [data];
+        session.localWriteQueuedBytes = data.length;
+        return;
+    }
+
+    if (written > 0 && written < data.length) {
+        session.bytesReceivedFromWs = (session.bytesReceivedFromWs || 0) + written;
+        const rest = data.subarray(written);
+        session.localWriteQueue = [rest];
+        session.localWriteQueuedBytes = rest.length;
+        return;
+    }
+
+    // Unexpected return value — treat as full success to avoid silent stall
+    session.bytesReceivedFromWs = (session.bytesReceivedFromWs || 0) + data.length;
+}
+
+function flushLocalWriteQueue(socket: any, session: Session): void {
+    if (session.closed || !session.localWriteQueue || session.localWriteQueue.length === 0) {
+        return;
+    }
+
+    while (session.localWriteQueue.length > 0) {
+        const chunk = session.localWriteQueue[0];
+        let written: number;
+        try {
+            written = socket.write(chunk);
+        } catch (err: any) {
+            closeSession(socket, session, `Local socket flush failed: ${err?.message || err}`);
+            return;
+        }
+
+        if (written === -1 || written == null || written === 0) {
+            return;
+        }
+
+        if (written < chunk.length) {
+            session.bytesReceivedFromWs = (session.bytesReceivedFromWs || 0) + written;
+            session.localWriteQueue[0] = chunk.subarray(written);
+            session.localWriteQueuedBytes -= written;
+            return;
+        }
+
+        session.bytesReceivedFromWs = (session.bytesReceivedFromWs || 0) + chunk.length;
+        session.localWriteQueue.shift();
+        session.localWriteQueuedBytes -= chunk.length;
+    }
+
+    session.localWriteQueue = undefined;
+    session.localWriteQueuedBytes = 0;
+
+    // Remote already closed: finish once every queued byte has been written
+    if (session.remoteClosed && !hasPendingLocalOutput(session)) {
+        finishLocalSocket(socket, session, true);
+    }
+}
+
+function enqueueWsMessage(socket: any, session: Session, payload: Uint8Array): void {
+    if (session.closed) return;
+    if (!session.wsMsgQueue) session.wsMsgQueue = [];
+    session.wsMsgQueue.push(payload);
+    session.wsMsgQueuedBytes += payload.length;
+    if (session.wsMsgQueuedBytes > WS_MSG_QUEUE_MAX) {
+        closeSession(
+            socket,
+            session,
+            `WS message queue overflow for ${session.destHost}:${session.destPort} (${session.wsMsgQueuedBytes} bytes)`
+        );
+        return;
+    }
+    processWsMessageQueue(socket, session);
+}
+
+function processWsMessageQueue(socket: any, session: Session): void {
+    if (session.closed || session.wsMsgProcessing) return;
+    session.wsMsgProcessing = true;
+    try {
+        while (session.wsMsgQueue && session.wsMsgQueue.length > 0) {
+            // Apply backpressure: stop feeding the local socket until drain frees space
+            if (session.localWriteQueuedBytes > LOCAL_WRITE_QUEUE_MAX / 2) {
+                break;
+            }
+            const msg = session.wsMsgQueue.shift()!;
+            session.wsMsgQueuedBytes -= msg.length;
+            handleWsPayload(socket, session, msg);
+            if (session.closed) break;
+        }
+        if (session.wsMsgQueue && session.wsMsgQueue.length === 0) {
+            session.wsMsgQueue = undefined;
+            session.wsMsgQueuedBytes = 0;
+        }
+        if (session.remoteClosed && !session.closed && !hasPendingLocalOutput(session)) {
+            finishLocalSocket(socket, session, true);
+        }
+    } finally {
+        session.wsMsgProcessing = false;
+    }
+}
+
+function handleWsPayload(socket: any, session: Session, normalized: Uint8Array): void {
+    session.firstRemotePayloadReceived = true;
+
+    if (!session.vlessResponseVerified) {
+        if (normalized.length < 2) {
+            log('error', `VLESS response too short: ${normalized.length} bytes for ${session.destHost}:${session.destPort}`);
+            sendSocksError(socket, session);
+            closeSession(socket, session);
+            return;
+        }
+
+        const vlessStatus = normalized[1];
+        if (vlessStatus !== 0) {
+            log('error', `VLESS rejected ${session.destHost}:${session.destPort}, status=${vlessStatus}`);
+            sendSocksError(socket, session);
+            closeSession(socket, session);
+            return;
+        }
+
+        session.vlessResponseVerified = true;
+
+        if (session.socksType === 'http') {
+            markHttpProxySuccess(socket, session);
+        } else {
+            markSocksSuccess(socket, session);
+        }
+
+        const payload = normalized.subarray(2);
+        if (payload.length > 0) {
+            log('debug', `[WS→SOCKET] writing ${payload.length} bytes to local socket`);
+            writeToLocalSocket(socket, session, payload);
+        }
+        return;
+    }
+
+    if (normalized.length > 0) {
+        log('debug', `[WS→SOCKET] writing ${normalized.length} bytes to local socket`);
+        writeToLocalSocket(socket, session, normalized);
+    }
+}
+
+/**
+ * Send client data to remote WebSocket, queueing when bufferedAmount is high.
+ */
+function sendToWs(socket: any, session: Session, data: Uint8Array): void {
+    if (session.closed || data.length === 0) return;
+
+    if (!session.ws || session.ws.readyState !== WebSocket.OPEN) {
+        log('debug', `[DATA→WS] buffering ${data.length} bytes (ws state=${session.ws?.readyState ?? 'none'})`);
+        session.pendingData = session.pendingData ? concatUint8Arrays(session.pendingData, data) : data;
+        return;
+    }
+
+    if (session.wsSendQueue && session.wsSendQueue.length > 0) {
+        session.wsSendQueue.push(data);
+        session.wsSendQueuedBytes += data.length;
+        scheduleWsFlush(socket, session);
+        return;
+    }
+
+    if (session.ws.bufferedAmount > WS_HIGH_WATER) {
+        log('debug', `[DATA→WS] backpressure: queue ${data.length} bytes (bufferedAmount=${session.ws.bufferedAmount})`);
+        session.wsSendQueue = [data];
+        session.wsSendQueuedBytes = data.length;
+        scheduleWsFlush(socket, session);
+        return;
+    }
+
+    log('debug', `[DATA→WS] forwarding ${data.length} bytes to ${session.destHost}:${session.destPort}`);
+    try {
+        session.ws.send(data);
+        session.bytesSentToWs = (session.bytesSentToWs || 0) + data.length;
+    } catch (err: any) {
+        closeSession(socket, session, `WS send failed: ${err?.message || err}`);
+    }
+}
+
+function scheduleWsFlush(socket: any, session: Session): void {
+    if (session.wsFlushTimer || session.closed) return;
+    session.wsFlushTimer = setInterval(() => {
+        flushWsSendQueue(socket, session);
+        if (!session.wsSendQueue || session.wsSendQueue.length === 0) {
+            if (session.wsFlushTimer) {
+                clearInterval(session.wsFlushTimer);
+                session.wsFlushTimer = undefined;
+            }
+        }
+    }, 10);
+}
+
+function flushWsSendQueue(socket: any, session: Session): void {
+    if (session.closed || !session.ws || session.ws.readyState !== WebSocket.OPEN) {
+        return;
+    }
+    if (!session.wsSendQueue || session.wsSendQueue.length === 0) {
+        return;
+    }
+
+    // Wait until buffer drains below low-water before resuming bulk sends
+    if (session.ws.bufferedAmount > WS_LOW_WATER) {
+        return;
+    }
+
+    while (session.wsSendQueue.length > 0) {
+        if (session.ws.bufferedAmount > WS_HIGH_WATER) {
+            break;
+        }
+        const chunk = session.wsSendQueue.shift()!;
+        session.wsSendQueuedBytes -= chunk.length;
+        try {
+            session.ws.send(chunk);
+            session.bytesSentToWs = (session.bytesSentToWs || 0) + chunk.length;
+        } catch (err: any) {
+            closeSession(socket, session, `WS send failed: ${err?.message || err}`);
+            return;
+        }
+    }
+
+    if (session.wsSendQueue.length === 0) {
+        session.wsSendQueue = undefined;
+        session.wsSendQueuedBytes = 0;
+    }
 }
 
 function parseUUID(uuid: string): Uint8Array {
@@ -230,6 +555,20 @@ interface Session {
     httpMethod?: string;
     bytesSentToWs: number;
     bytesReceivedFromWs: number;
+    /** Partial / blocked writes waiting for local socket drain (WS → client). */
+    localWriteQueue?: Uint8Array[];
+    localWriteQueuedBytes: number;
+    /** Raw WS message payloads waiting to be written locally (ordered). */
+    wsMsgQueue?: Uint8Array[];
+    wsMsgQueuedBytes: number;
+    wsMsgProcessing: boolean;
+    /** Client → WS chunks waiting for bufferedAmount to drop. */
+    wsSendQueue?: Uint8Array[];
+    wsSendQueuedBytes: number;
+    wsFlushTimer?: ReturnType<typeof setInterval>;
+    closed?: boolean;
+    /** Remote WS closed; end local socket only after write queues drain. */
+    remoteClosed?: boolean;
 }
 
 /**
@@ -243,20 +582,11 @@ class BunVLESSClient {
         const socketHandlers = {
             async data(socket: any, data: Uint8Array) {
                 const session = socket.data as unknown as Session;
-                if (!session) return;
+                if (!session || session.closed) return;
 
                 try {
                     if (session.state === 'forwarding') {
-                        if (session.ws && session.ws.readyState === WebSocket.OPEN) {
-                            const len = data.byteLength ?? data.length ?? 0;
-                            log('debug', `[DATA→WS] forwarding ${len} bytes to ${session.destHost}:${session.destPort} (ws.readyState=${session.ws.readyState})`);
-                            session.ws.send(data);
-                            session.bytesSentToWs = (session.bytesSentToWs || 0) + len;
-                        } else {
-                            const len = data.byteLength ?? data.length ?? 0;
-                            log('debug', `[DATA→WS] buffering ${len} bytes (ws state=${session.ws?.readyState ?? 'none'})`);
-                            session.pendingData = session.pendingData ? concatUint8Arrays(session.pendingData, data) : data;
-                        }
+                        sendToWs(socket, session, data);
                     } else if (session.state === 'greeting') {
                         await handleSocksGreeting(socket, data, session);
                     } else if (session.state === 'request') {
@@ -268,11 +598,24 @@ class BunVLESSClient {
                     }
                 } catch (err: any) {
                     log('error', `Session error: ${err.message}`);
-                    socket.end();
+                    closeSession(socket, session);
+                }
+            },
+            /**
+             * Kernel write buffer has space again — flush queued WS→client bytes,
+             * then continue applying any deferred WS messages.
+             */
+            drain(socket: any) {
+                const session = socket.data as unknown as Session;
+                if (!session || session.closed) return;
+                flushLocalWriteQueue(socket, session);
+                processWsMessageQueue(socket, session);
+                if (session.remoteClosed && !session.closed && !hasPendingLocalOutput(session)) {
+                    finishLocalSocket(socket, session, true);
                 }
             },
             open(socket: any) {
-                socket.data = { 
+                socket.data = {
                     state: 'greeting',
                     socksType: 'socks5',
                     firstRemotePayloadReceived: false,
@@ -280,12 +623,27 @@ class BunVLESSClient {
                     vlessResponseVerified: false,
                     bytesSentToWs: 0,
                     bytesReceivedFromWs: 0,
-                };
+                    localWriteQueuedBytes: 0,
+                    wsMsgQueuedBytes: 0,
+                    wsMsgProcessing: false,
+                    wsSendQueuedBytes: 0,
+                    closed: false,
+                } satisfies Session;
             },
             close(socket: any) {
                 const session = socket.data as unknown as Session;
-                if (session?.ws) {
-                    session.ws.close();
+                if (!session) return;
+                session.closed = true;
+                if (session.wsFlushTimer) {
+                    clearInterval(session.wsFlushTimer);
+                    session.wsFlushTimer = undefined;
+                }
+                if (session.ws) {
+                    try {
+                        session.ws.close();
+                    } catch {
+                        // ignore
+                    }
                 }
             },
             error(socket: any, error: Error) {
@@ -664,9 +1022,8 @@ async function establishVlessConnection(
         const timeout = setTimeout(() => {
             if (ws.readyState !== WebSocket.OPEN) {
                 log('error', `WebSocket connection timeout for ${host}:${port}`);
-                ws.close();
                 sendSocksError(socket, session);
-                socket.end();
+                closeSession(socket, session);
             }
         }, WS_TIMEOUT);
 
@@ -679,7 +1036,8 @@ async function establishVlessConnection(
             if (session.pendingData && session.pendingData.length > 0) {
                 const earlyData = session.pendingData;
                 session.pendingData = undefined;
-                ws.send(earlyData);
+                // Early data may be large; use backpressured send path
+                sendToWs(socket, session, earlyData);
             }
 
             session.pendingData = undefined;
@@ -687,70 +1045,37 @@ async function establishVlessConnection(
             log('info', `[WS OPEN] ${session.socksType.toUpperCase()} ${host}:${port} - waiting VLESS response`);
         };
 
-        ws.onmessage = async (event) => {
-            const normalized = await normalizeWsMessageData(event.data);
+        // Synchronous + ordered: avoid concurrent async onmessage reordering under load
+        ws.onmessage = (event) => {
+            if (session.closed) return;
+            const normalized = normalizeWsMessageData(event.data);
             if (!normalized) {
                 log('warn', `Unsupported WS message type for ${host}:${port}: ${typeof event.data}`);
                 return;
             }
-
-            session.firstRemotePayloadReceived = true;
-
-            if (!session.vlessResponseVerified) {
-                if (normalized.length < 2) {
-                    log('error', `VLESS response too short: ${normalized.length} bytes for ${host}:${port}`);
-                    sendSocksError(socket, session);
-                    socket.end();
-                    return;
-                }
-
-                const vlessStatus = normalized[1];
-                if (vlessStatus !== 0) {
-                    log('error', `VLESS rejected ${host}:${port}, status=${vlessStatus}`);
-                    sendSocksError(socket, session);
-                    socket.end();
-                    return;
-                }
-
-                session.vlessResponseVerified = true;
-
-                if (session.socksType === 'http') {
-                    markHttpProxySuccess(socket, session);
-                } else {
-                    markSocksSuccess(socket, session);
-                }
-
-                const payload = normalized.subarray(2);
-                if (payload.length > 0) {
-                    let prefix = '';
-                    if (session.socksType === 'http') {
-                        const preview = new TextDecoder().decode(payload.subarray(0, Math.min(60, payload.length)));
-                        prefix = ` first="${preview.replace(/\r\n/g, '\\r\\n')}"`;
-                    }
-                    log('debug', `[WS→SOCKET] writing ${payload.length} bytes${prefix} to local socket`);
-                    socket.write(payload);
-                    session.bytesReceivedFromWs = (session.bytesReceivedFromWs || 0) + payload.length;
-                }
-                return;
-            }
-
-            if (normalized.length > 0) {
-                log('debug', `[WS→SOCKET] writing ${normalized.length} bytes to local socket`);
-                socket.write(normalized);
-                session.bytesReceivedFromWs = (session.bytesReceivedFromWs || 0) + normalized.length;
-            }
+            enqueueWsMessage(socket, session, normalized);
         };
 
         ws.onclose = (event) => {
             const sent = session.bytesSentToWs ?? 0;
             const recv = session.bytesReceivedFromWs ?? 0;
+            const queued =
+                (session.localWriteQueuedBytes || 0) +
+                (session.wsMsgQueuedBytes || 0) +
+                (session.wsSendQueuedBytes || 0);
             log(
                 session.firstRemotePayloadReceived ? 'debug' : 'warn',
                 `Remote WS closed for ${host}:${port} (code=${event.code}, clean=${event.wasClean}, reason=${event.reason || 'none'}, firstPayload=${session.firstRemotePayloadReceived ? 'yes' : 'no'})` +
-                ` traffic: ↑${sent} ↓${recv}`
+                ` traffic: ↑${sent} ↓${recv}` +
+                (queued > 0 ? ` queued=${queued}` : '')
             );
             debugLog(`ws close ${session.destHost || '?'}:${session.destPort || '?'} code=${event.code} reason=${event.reason || ''}`);
-            socket.end();
+            clearWsFlushTimer(session);
+            // Drain remaining WS→client bytes before half-closing local socket
+            session.remoteClosed = true;
+            processWsMessageQueue(socket, session);
+            flushLocalWriteQueue(socket, session);
+            finishLocalSocket(socket, session, !hasPendingLocalOutput(session));
         };
 
         ws.onerror = (e: any) => {
@@ -758,13 +1083,13 @@ async function establishVlessConnection(
             if (!session.socksReplySent) {
                 sendSocksError(socket, session);
             }
-            socket.end();
+            closeSession(socket, session);
         };
 
     } catch (err: any) {
         log('error', `WebSocket creation failed: ${err.message}`);
         sendSocksError(socket, session);
-        socket.end();
+        closeSession(socket, session);
     }
 }
 
@@ -853,7 +1178,11 @@ function markHttpProxySuccess(socket: any, session: Session) {
     session.socksReplySent = true;
 }
 
-async function normalizeWsMessageData(data: any): Promise<Uint8Array | null> {
+/**
+ * Normalize WS payload to Uint8Array (sync).
+ * binaryType is "arraybuffer", so Blob is unexpected; callers skip unsupported types.
+ */
+function normalizeWsMessageData(data: any): Uint8Array | null {
     if (data instanceof ArrayBuffer) {
         return new Uint8Array(data);
     }
@@ -862,9 +1191,6 @@ async function normalizeWsMessageData(data: any): Promise<Uint8Array | null> {
     }
     if (typeof Buffer !== "undefined" && data instanceof Buffer) {
         return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    }
-    if (data instanceof Blob) {
-        return new Uint8Array(await data.arrayBuffer());
     }
     return null;
 }

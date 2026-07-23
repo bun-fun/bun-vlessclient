@@ -7,3 +7,4 @@ CLAUDE.md
 .nezha/
 test_*.mjs
 test_*.js
+.smallcode/
