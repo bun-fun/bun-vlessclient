@@ -8,3 +8,8 @@ CLAUDE.md
 test_*.mjs
 test_*.js
 .smallcode/
+
+debug*.log
+debug*.err
+gitout*.log
+gitout*.err
