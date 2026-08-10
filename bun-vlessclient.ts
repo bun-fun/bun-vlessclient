@@ -43,6 +43,7 @@ interface Config {
         insecure?: boolean;
     };
     timeout?: number;
+    ws_ping_interval?: number;
     transport?: {
         type?: string;
         path?: string;
@@ -85,6 +86,12 @@ const log = LOG_LEVEL === 'none'
 
 function debugLog(message: string) {
     log('debug', message);
+}
+
+function formatBytes(bytes: number): string {
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 // --- Config helpers: cfg > env > default ---
@@ -154,6 +161,14 @@ const WS_LOW_WATER = 256 * 1024; // 256 KiB
 const LOCAL_WRITE_QUEUE_MAX = 16 * 1024 * 1024; // 16 MiB
 /** Max bytes of raw WS messages waiting to be applied to the local socket. */
 const WS_MSG_QUEUE_MAX = 16 * 1024 * 1024; // 16 MiB
+/** WebSocket keepalive ping interval in seconds (0 = disabled). */
+const WS_PING_INTERVAL = cfgNum('ws_ping_interval', 'WS_PING_INTERVAL', 30);
+/** App-level keepalive interval in seconds (0 = disabled). Sends a DATA frame
+ * that Cloudflare's WS proxy counts as activity (it ignores control-frame
+ * pings), preventing idle-timed disconnects during long quiet transfers. */
+const WS_APP_KEEPALIVE_INTERVAL = cfgNum('ws_app_keepalive_interval', 'WS_APP_KEEPALIVE_INTERVAL', 25);
+/** Warn when a single connection receives more than this many bytes from the remote. */
+const WS_DATA_WARN_THRESHOLD = 25 * 1024 * 1024; // 25 MB
 
 let OUTBOUND: VlessOutbound = {
     server: cfgStr('remote.host', 'REMOTE_HOST', 'example.com'),
@@ -189,6 +204,20 @@ function clearWsFlushTimer(session: Session) {
     }
 }
 
+function clearPingTimer(session: Session) {
+    if (session.pingTimer) {
+        clearInterval(session.pingTimer);
+        session.pingTimer = undefined;
+    }
+}
+
+function clearAppPingTimer(session: Session) {
+    if (session.appPingTimer) {
+        clearInterval(session.appPingTimer);
+        session.appPingTimer = undefined;
+    }
+}
+
 function hasPendingLocalOutput(session: Session): boolean {
     return (
         (session.localWriteQueuedBytes || 0) > 0 ||
@@ -207,6 +236,8 @@ function finishLocalSocket(socket: any, session: Session, force = false) {
     }
     session.closed = true;
     clearWsFlushTimer(session);
+    clearPingTimer(session);
+    clearAppPingTimer(session);
     try {
         socket.end();
     } catch {
@@ -219,6 +250,8 @@ function closeSession(socket: any, session: Session, reason?: string) {
     if (reason) log('warn', reason);
     session.closed = true;
     clearWsFlushTimer(session);
+    clearPingTimer(session);
+    clearAppPingTimer(session);
     try {
         session.ws?.close();
     } catch {
@@ -404,6 +437,14 @@ function handleWsPayload(socket: any, session: Session, normalized: Uint8Array):
         log('debug', `[WS→SOCKET] writing ${normalized.length} bytes to local socket`);
         writeToLocalSocket(socket, session, normalized);
     }
+
+    if (!session.dataWarnLogged && (session.bytesReceivedFromWs || 0) > WS_DATA_WARN_THRESHOLD) {
+        session.dataWarnLogged = true;
+        log('warn',
+            `Data received from WS exceeds ${formatBytes(WS_DATA_WARN_THRESHOLD)} for ${session.destHost}:${session.destPort}. ` +
+            `Connection may be closed by server due to data limit.`
+        );
+    }
 }
 
 /**
@@ -569,6 +610,14 @@ interface Session {
     closed?: boolean;
     /** Remote WS closed; end local socket only after write queues drain. */
     remoteClosed?: boolean;
+    /** WebSocket keepalive ping timer. */
+    pingTimer?: ReturnType<typeof setInterval>;
+    /** App-level keepalive (data-frame) timer, defeats CF idle timeout. */
+    appPingTimer?: ReturnType<typeof setInterval>;
+    /** Timestamp of last pong received from remote. */
+    lastPongTime?: number;
+    /** Whether the data-warning has been logged for this session. */
+    dataWarnLogged?: boolean;
 }
 
 /**
@@ -628,6 +677,8 @@ class BunVLESSClient {
                     wsMsgProcessing: false,
                     wsSendQueuedBytes: 0,
                     closed: false,
+                    lastPongTime: 0,
+                    dataWarnLogged: false,
                 } satisfies Session;
             },
             close(socket: any) {
@@ -638,6 +689,8 @@ class BunVLESSClient {
                     clearInterval(session.wsFlushTimer);
                     session.wsFlushTimer = undefined;
                 }
+                clearPingTimer(session);
+                clearAppPingTimer(session);
                 if (session.ws) {
                     try {
                         session.ws.close();
@@ -1030,6 +1083,37 @@ async function establishVlessConnection(
         ws.onopen = () => {
             clearTimeout(timeout);
 
+            // Start WebSocket keepalive (ping/pong) to prevent idle-timeout disconnects
+            if (WS_PING_INTERVAL > 0) {
+                session.lastPongTime = Date.now();
+                session.pingTimer = setInterval(() => {
+                    if (session.ws?.readyState === WebSocket.OPEN) {
+                        try {
+                            (session.ws as any).ping();
+                        } catch {
+                            // ignore ping errors
+                        }
+                    }
+                }, WS_PING_INTERVAL * 1000);
+            }
+
+            // App-level keepalive: Cloudflare only resets its 100s WS idle timer
+            // on DATA frames (control-frame pings are ignored), so send a small
+            // data-frame keepalive the proxy answers without forwarding to the
+            // origin. This keeps the tunnel alive through long quiet transfers.
+            if (WS_APP_KEEPALIVE_INTERVAL > 0) {
+                session.appPingTimer = setInterval(() => {
+                    if (session.closed) return;
+                    if (session.ws?.readyState === WebSocket.OPEN) {
+                        try {
+                            session.ws.send(JSON.stringify({ type: 'keepalive' }));
+                        } catch {
+                            // ignore send errors
+                        }
+                    }
+                }, WS_APP_KEEPALIVE_INTERVAL * 1000);
+            }
+
             const vlessHeader = createVlessHeader(port, vlessAType, addrPortBuf);
             ws.send(vlessHeader);
 
@@ -1048,6 +1132,21 @@ async function establishVlessConnection(
         // Synchronous + ordered: avoid concurrent async onmessage reordering under load
         ws.onmessage = (event) => {
             if (session.closed) return;
+            // App-level keepalive pong from the proxy — consume, never forward.
+            if (typeof event.data === 'string') {
+                let isKeepalive = false;
+                try {
+                    isKeepalive = (JSON.parse(event.data) as any)?.type === 'keepalive';
+                } catch {
+                    // not JSON
+                }
+                if (isKeepalive) {
+                    debugLog(`keepalive pong for ${host}:${port}`);
+                    return;
+                }
+                log('warn', `Unsupported WS text message for ${host}:${port}: ${event.data}`);
+                return;
+            }
             const normalized = normalizeWsMessageData(event.data);
             if (!normalized) {
                 log('warn', `Unsupported WS message type for ${host}:${port}: ${typeof event.data}`);
@@ -1056,7 +1155,13 @@ async function establishVlessConnection(
             enqueueWsMessage(socket, session, normalized);
         };
 
+        (ws as any).onpong = () => {
+            session.lastPongTime = Date.now();
+        };
+
         ws.onclose = (event) => {
+            clearPingTimer(session);
+            clearAppPingTimer(session);
             const sent = session.bytesSentToWs ?? 0;
             const recv = session.bytesReceivedFromWs ?? 0;
             const queued =
@@ -1069,6 +1174,14 @@ async function establishVlessConnection(
                 ` traffic: ↑${sent} ↓${recv}` +
                 (queued > 0 ? ` queued=${queued}` : '')
             );
+            // Log actionable warning for abnormal closure with large data transfer
+            if (event.code === 1006 && recv > WS_DATA_WARN_THRESHOLD) {
+                log('warn',
+                    `Abnormal WS closure (code=1006) after receiving ${formatBytes(recv)} from ${host}:${port}. ` +
+                    `This is likely caused by a server-side data limit (~${formatBytes(WS_DATA_WARN_THRESHOLD)}). ` +
+                    `For git clone, try: git -c http.version=HTTP/1.1 -c protocol.version=2 clone --depth 1 --filter=tree:0 --sparse <url>, then use 'git sparse-checkout set' to fetch directories incrementally.`
+                );
+            }
             debugLog(`ws close ${session.destHost || '?'}:${session.destPort || '?'} code=${event.code} reason=${event.reason || ''}`);
             clearWsFlushTimer(session);
             // Drain remaining WS→client bytes before half-closing local socket

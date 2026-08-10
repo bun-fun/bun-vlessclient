@@ -1,6 +1,8 @@
 {
     "log_level": "info",
     "local_port": 1080,
+    "ws_ping_interval": 30,
+    "ws_app_keepalive_interval": 25,
     "remote": {
         "host": "example.com",
         "port": 443,
